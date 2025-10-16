@@ -7,6 +7,7 @@ import {
   clearTokens,
   isTokenExpired,
   refreshAccessToken,
+  setTokens,
 } from '../components/login/tokenUtils';
 
 export const api = axios.create({
@@ -112,3 +113,125 @@ export const getWebSocketUrl = (path: string): string => {
 
   return `${wsProtocol}://${baseUrlWithoutProtocol}${path}`;
 };
+
+// ===================================
+// GitHub SSO API Functions
+// ===================================
+
+/**
+ * Initiates GitHub OAuth flow by redirecting to backend OAuth endpoint
+ */
+export const initiateGitHubLogin = (): void => {
+  const baseUrl = process.env.VITE_BASE_URL || 'http://localhost:4000';
+  window.location.href = `${baseUrl}/auth/github`;
+};
+
+/**
+ * Handles GitHub OAuth callback by extracting tokens from URL
+ * This should be called on the callback page after GitHub redirects back
+ */
+export const handleGitHubCallback = (): {
+  success: boolean;
+  accessToken?: string;
+  refreshToken?: string;
+  error?: string;
+} => {
+  try {
+    const urlParams = new URLSearchParams(window.location.search);
+    const accessToken = urlParams.get('token');
+    const refreshToken = urlParams.get('refreshToken');
+    const error = urlParams.get('error');
+
+    if (error) {
+      console.error('GitHub OAuth error:', error);
+      return { success: false, error };
+    }
+
+    if (accessToken && refreshToken) {
+      // Store tokens using your existing token utility
+      setTokens(accessToken, refreshToken);
+      
+      // Clean up URL by removing query parameters
+      window.history.replaceState({}, document.title, window.location.pathname);
+      
+      return { success: true, accessToken, refreshToken };
+    }
+
+    return { success: false, error: 'No tokens received from OAuth callback' };
+  } catch (error) {
+    console.error('Error handling GitHub callback:', error);
+    return { 
+      success: false, 
+      error: error instanceof Error ? error.message : 'Unknown error occurred' 
+    };
+  }
+};
+
+/**
+ * Alternative callback handler if backend returns JSON response
+ * Use this if you modify backend to return JSON instead of redirecting
+ */
+export const exchangeGitHubCode = async (code: string, state: string) => {
+  try {
+    const response = await api.get('/auth/github/callback', {
+      params: { code, state },
+    });
+
+    const { access_token, refresh_token, user } = response.data;
+
+    if (access_token && refresh_token) {
+      setTokens(access_token, refresh_token);
+      return { success: true, user };
+    }
+
+    return { success: false, error: 'Invalid response from server' };
+  } catch (error) {
+    console.error('GitHub code exchange failed:', error);
+    if (axios.isAxiosError(error)) {
+      return {
+        success: false,
+        error: error.response?.data?.error || 'Failed to authenticate with GitHub',
+      };
+    }
+    return { success: false, error: 'Unknown error occurred' };
+  }
+};
+
+/**
+ * Check if user is authenticated via GitHub SSO
+ * Returns user info if authenticated
+ */
+export const checkGitHubAuth = async () => {
+  try {
+    const response = await api.get('/api/me');
+    return { success: true, user: response.data };
+  } catch (error) {
+    console.error('GitHub auth check failed:', error);
+    return { success: false, error: 'Not authenticated' };
+  }
+};
+
+/**
+ * Utility to check if current session is from GitHub SSO
+ */
+export const isGitHubSSOSession = (): boolean => {
+  // You can store this flag during GitHub login
+  return localStorage.getItem('auth_provider') === 'github';
+};
+
+/**
+ * Set authentication provider (call this after successful GitHub login)
+ */
+export const setAuthProvider = (provider: 'local' | 'github'): void => {
+  localStorage.setItem('auth_provider', provider);
+};
+
+/**
+ * Clear authentication provider on logout
+ */
+export const clearAuthProvider = (): void => {
+  localStorage.removeItem('auth_provider');
+};
+
+// Export existing api instance as default
+export default api;

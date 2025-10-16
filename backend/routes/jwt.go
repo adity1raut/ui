@@ -1,8 +1,14 @@
 package routes
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -12,7 +18,23 @@ import (
 	"github.com/kubestellar/ui/backend/models"
 	database "github.com/kubestellar/ui/backend/postgresql/Database"
 	"github.com/kubestellar/ui/backend/utils"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/github"
 )
+
+// GitHub OAuth configuration
+var githubOAuthConfig *oauth2.Config
+
+// Initialize GitHub OAuth config
+func InitGitHubOAuth() {
+	githubOAuthConfig = &oauth2.Config{
+		ClientID:     os.Getenv("GITHUB_CLIENT_ID"),
+		ClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
+		RedirectURL:  os.Getenv("GITHUB_REDIRECT_URL"), // e.g., "http://localhost:4000/auth/github/callback"
+		Scopes:       []string{"user:email"},
+		Endpoint:     github.Endpoint,
+	}
+}
 
 // SetupRoutes initializes all routes - THIS IS THE MISSING FUNCTION!
 func setupdebug(router *gin.Engine) {
@@ -113,9 +135,17 @@ func setupdebug(router *gin.Engine) {
 func setupAuthRoutes(router *gin.Engine) {
 
 	setupdebug(router) // Add debug routes for testing
+
+	// Initialize GitHub OAuth
+	InitGitHubOAuth()
+
 	// Public routes (no authentication required)
 	router.POST("/login", LoginHandler)
 	router.POST("/api/refresh", RefreshTokenHandler)
+
+	// GitHub OAuth routes
+	router.GET("/auth/github", GitHubLoginHandler)
+	router.GET("/auth/github/callback", GitHubCallbackHandler)
 
 	// API group - ALL endpoints require authentication
 	api := router.Group("/api")
@@ -1089,4 +1119,244 @@ func DeleteDashboardWidgetHandler(c *gin.Context) {
 		"message": "Dashboard widget deleted successfully",
 		"id":      id,
 	})
+}
+
+// GitHubLoginHandler initiates GitHub OAuth flow
+func GitHubLoginHandler(c *gin.Context) {
+	// Generate random state for CSRF protection
+	state := generateStateToken()
+
+	// Store state in session/cookie (you may want to use Redis or database)
+	c.SetCookie("oauth_state", state, 600, "/", "", false, true)
+
+	// Redirect to GitHub OAuth page
+	url := githubOAuthConfig.AuthCodeURL(state, oauth2.AccessTypeOnline)
+	c.Redirect(http.StatusTemporaryRedirect, url)
+}
+
+// GitHubCallbackHandler handles GitHub OAuth callback
+func GitHubCallbackHandler(c *gin.Context) {
+	// Verify state to prevent CSRF
+	state := c.Query("state")
+	savedState, err := c.Cookie("oauth_state")
+	if err != nil || state != savedState {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid OAuth state"})
+		return
+	}
+
+	// Clear the state cookie
+	c.SetCookie("oauth_state", "", -1, "/", "", false, true)
+
+	// Get authorization code
+	code := c.Query("code")
+	if code == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Authorization code not provided"})
+		return
+	}
+
+	// Exchange code for token
+	ctx := context.Background()
+	token, err := githubOAuthConfig.Exchange(ctx, code)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to exchange token"})
+		return
+	}
+
+	// Get user info from GitHub
+	githubUser, err := getGitHubUser(token.AccessToken)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user info from GitHub"})
+		return
+	}
+
+	// Get or create user in database
+	user, err := getOrCreateGitHubUser(githubUser)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process user"})
+		return
+	}
+
+	// Generate JWT tokens
+	accessToken, refreshToken, err := issueTokens(user.ID, user.Username, user.IsAdmin, user.Permissions)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate tokens"})
+		return
+	}
+
+	// Redirect to frontend with tokens (or send as JSON)
+	// Option 1: Redirect with tokens in query params (less secure, for demo only)
+	redirectURL := os.Getenv("FRONTEND_URL") + "/auth/callback?token=" + accessToken + "&refreshToken=" + refreshToken
+	c.Redirect(http.StatusTemporaryRedirect, redirectURL)
+
+	// Option 2: Return JSON (more secure, requires frontend handling)
+	// sendLoginResponse(c, accessToken, refreshToken, user.Username, user.IsAdmin, user.Permissions)
+}
+
+// GitHub user structure
+type GitHubUser struct {
+	ID        int    `json:"id"`
+	Login     string `json:"login"`
+	Email     string `json:"email"`
+	Name      string `json:"name"`
+	AvatarURL string `json:"avatar_url"`
+}
+
+// getGitHubUser fetches user info from GitHub API
+func getGitHubUser(accessToken string) (*GitHubUser, error) {
+	req, err := http.NewRequest("GET", "https://api.github.com/user", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("failed to fetch GitHub user")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var githubUser GitHubUser
+	if err := json.Unmarshal(body, &githubUser); err != nil {
+		return nil, err
+	}
+
+	// If email is not public, fetch it separately
+	if githubUser.Email == "" {
+		email, _ := getGitHubUserEmail(accessToken)
+		githubUser.Email = email
+	}
+
+	return &githubUser, nil
+}
+
+// getGitHubUserEmail fetches primary email from GitHub API
+func getGitHubUserEmail(accessToken string) (string, error) {
+	req, err := http.NewRequest("GET", "https://api.github.com/user/emails", nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.New("failed to fetch GitHub user emails")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var emails []struct {
+		Email    string `json:"email"`
+		Primary  bool   `json:"primary"`
+		Verified bool   `json:"verified"`
+	}
+
+	if err := json.Unmarshal(body, &emails); err != nil {
+		return "", err
+	}
+
+	// Return primary verified email
+	for _, email := range emails {
+		if email.Primary && email.Verified {
+			return email.Email, nil
+		}
+	}
+
+	return "", errors.New("no verified email found")
+}
+
+// getOrCreateGitHubUser gets existing user or creates new one
+func getOrCreateGitHubUser(githubUser *GitHubUser) (*models.User, error) {
+	// Create unique username from GitHub login
+	username := "github_" + githubUser.Login
+
+	// Check if user exists
+	user, err := models.GetUserByUsername(username)
+	if err == nil && user != nil {
+		// Update last login time
+		query := `UPDATE users SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`
+		database.DB.Exec(query, user.ID)
+		return user, nil
+	}
+
+	// Create new user
+	// Generate random password (won't be used for GitHub SSO)
+	randomPassword := generateRandomPassword(32)
+
+	newUser, err := models.CreateUser(username, randomPassword, false)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set default permissions for new SSO users
+	defaultPermissions := []models.Permission{
+		{Component: "dashboard", Permission: "read"},
+		{Component: "resources", Permission: "read"},
+	}
+
+	if err := models.SetUserPermissions(newUser.ID, defaultPermissions); err != nil {
+		return nil, err
+	}
+
+	// Store GitHub user info (optional: create oauth_users table)
+	if err := storeGitHubUserInfo(newUser.ID, githubUser); err != nil {
+		// Log error but don't fail the login
+		println("Warning: Failed to store GitHub user info:", err.Error())
+	}
+
+	return newUser, nil
+}
+
+// storeGitHubUserInfo stores GitHub-specific user information
+func storeGitHubUserInfo(userID int, githubUser *GitHubUser) error {
+	query := `
+        INSERT INTO oauth_users (user_id, provider, provider_user_id, email, avatar_url, name)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (user_id, provider) 
+        DO UPDATE SET 
+            provider_user_id = EXCLUDED.provider_user_id,
+            email = EXCLUDED.email,
+            avatar_url = EXCLUDED.avatar_url,
+            name = EXCLUDED.name,
+            updated_at = CURRENT_TIMESTAMP
+    `
+
+	_, err := database.DB.Exec(query, userID, "github", githubUser.ID,
+		githubUser.Email, githubUser.AvatarURL, githubUser.Name)
+	return err
+}
+
+// Helper functions
+func generateStateToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.URLEncoding.EncodeToString(b)
+}
+
+func generateRandomPassword(length int) string {
+	b := make([]byte, length)
+	rand.Read(b)
+	return base64.URLEncoding.EncodeToString(b)
 }

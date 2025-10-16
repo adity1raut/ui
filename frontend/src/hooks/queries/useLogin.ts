@@ -3,11 +3,17 @@ import { useNavigate } from 'react-router-dom';
 import { useWebSocket } from '../../context/useWebSocket';
 import toast from 'react-hot-toast';
 import axios from 'axios';
-import { LoginUser } from '../../api/auth';
+import { LoginUser, initiateGitHubLogin, handleGitHubCallback } from '../../api/auth';
 import { AUTH_QUERY_KEY } from '../../api/auth/constant';
 import { useTranslation } from 'react-i18next';
 import { encryptData, secureSet, secureRemove } from '../../utils/secureStorage';
-import { setAccessToken, setRefreshToken, clearTokens } from '../../components/login/tokenUtils';
+import { 
+  setAccessToken, 
+  setRefreshToken, 
+  clearTokens,
+  setAuthProvider,
+  setTokens 
+} from '../../components/login/tokenUtils';
 
 interface LoginCredentials {
   username: string;
@@ -29,7 +35,10 @@ export const useLogin = () => {
         if (!response.token) {
           throw new Error(t('auth.login.noToken'));
         }
+        
         setAccessToken(response.token);
+        setAuthProvider('local'); // Mark as local login
+        
         if (
           'refreshToken' in response &&
           typeof response.refreshToken === 'string' &&
@@ -57,7 +66,6 @@ export const useLogin = () => {
     },
     onSuccess: data => {
       toast.dismiss('auth-loading');
-
       toast.success(t('auth.login.success'));
 
       // Connect to websockets with new token
@@ -84,13 +92,9 @@ export const useLogin = () => {
     onError: error => {
       toast.dismiss('auth-loading');
 
-      // Don't log the raw error to console to avoid showing technical details
-      // console.error(t('auth.login.error'), error);
-
       let errorMessage = t('auth.login.invalidCredentials');
 
       if (axios.isAxiosError(error)) {
-        // Handle different types of authentication errors
         if (error.response?.status === 401) {
           errorMessage = t('auth.login.invalidCredentials');
         } else if (error.response?.status === 400) {
@@ -104,14 +108,73 @@ export const useLogin = () => {
             t('auth.login.authFailed');
         }
       } else if (error instanceof Error) {
-        // For non-axios errors, use a generic message instead of the raw error
         errorMessage = t('auth.login.authFailed');
       }
 
-      // Use a consistent toast ID to prevent duplicates
       toast.error(errorMessage, { id: 'login-error' });
     },
   });
+};
+
+/**
+ * Hook for GitHub SSO login
+ */
+export const useGitHubLogin = () => {
+  const navigate = useNavigate();
+  const { connect, connectWecs } = useWebSocket();
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  const handleCallback = useMutation({
+    mutationFn: async () => {
+      const result = handleGitHubCallback();
+      
+      if (!result.success) {
+        throw new Error(result.error || 'GitHub authentication failed');
+      }
+
+      if (result.accessToken && result.refreshToken) {
+        setTokens(result.accessToken, result.refreshToken);
+        setAuthProvider('github'); // Mark as GitHub login
+      }
+
+      return result;
+    },
+    onSuccess: () => {
+      toast.dismiss('github-auth-loading');
+      toast.success(t('auth.login.success'));
+
+      // Connect to websockets with new token
+      connect(true);
+      connectWecs(true);
+
+      // Update auth state
+      queryClient.invalidateQueries({ queryKey: AUTH_QUERY_KEY });
+
+      const redirectPath = localStorage.getItem('redirectAfterLogin') || '/';
+      localStorage.removeItem('redirectAfterLogin');
+
+      setTimeout(() => {
+        navigate(redirectPath);
+      }, 1000);
+    },
+    onError: (error: Error) => {
+      toast.dismiss('github-auth-loading');
+      
+      const errorMessage = error.message || t('auth.login.githubAuthFailed');
+      toast.error(errorMessage, { id: 'github-login-error' });
+    },
+  });
+
+  return {
+    initiateLogin: () => {
+      toast.loading(t('auth.login.redirectingToGitHub'), { id: 'github-auth-loading' });
+      initiateGitHubLogin();
+    },
+    handleCallback: handleCallback.mutate,
+    isLoading: handleCallback.isPending,
+    error: handleCallback.error,
+  };
 };
 
 export const logout = () => {

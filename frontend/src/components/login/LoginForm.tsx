@@ -7,6 +7,7 @@ import { useLogin } from '../../hooks/queries/useLogin';
 import { useTranslation } from 'react-i18next'; // Add this import
 import { decryptData, isEncrypted, migratePassword, secureGet } from '../../utils/secureStorage';
 import { FiInfo } from 'react-icons/fi';
+import { GitHubSSOButton } from './GitHubSSOButton';
 
 const LoginForm = () => {
   const { t } = useTranslation(); // Add translation hook
@@ -312,6 +313,32 @@ const LoginForm = () => {
         )}
         <span className="absolute left-0 top-0 h-full w-full bg-gradient-to-r from-white/10 to-transparent opacity-0 transition-opacity duration-300 hover:opacity-100"></span>
       </motion.button>
+
+      {/* Divider */}
+      <motion.div
+        className="relative my-6"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ delay: 0.5 }}
+      >
+        <div className="absolute inset-0 flex items-center">
+          <div className="w-full border-t border-blue-300/20"></div>
+        </div>
+        <div className="relative flex justify-center text-sm">
+          <span className="bg-[#0f1419] px-2 text-blue-200/70">
+            {t('login.form.or', { defaultValue: 'Or continue with' })}
+          </span>
+        </div>
+      </motion.div>
+
+      {/* GitHub SSO Button */}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.6 }}
+      >
+        <GitHubSSOButton fullWidth disabled={isPending} />
+      </motion.div>
     </form>
   );
 };
